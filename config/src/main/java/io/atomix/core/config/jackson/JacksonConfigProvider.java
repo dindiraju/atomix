@@ -16,6 +16,9 @@
 package io.atomix.core.config.jackson;
 
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.ObjectCodec;
+import com.fasterxml.jackson.core.io.IOContext;
+import com.fasterxml.jackson.core.util.BufferRecycler;
 import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -25,6 +28,7 @@ import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.dataformat.yaml.YAMLParser;
 import io.atomix.core.config.ConfigProvider;
 import io.atomix.primitive.PrimitiveConfig;
 import io.atomix.primitive.PrimitiveProtocolConfig;
@@ -36,11 +40,16 @@ import io.atomix.primitive.partition.PartitionGroups;
 import io.atomix.utils.Config;
 import io.atomix.utils.ConfigurationException;
 
+import java.io.CharArrayReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.Reader;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Jackson configuration provider.
@@ -75,7 +84,7 @@ public class JacksonConfigProvider implements ConfigProvider {
   }
 
   private <C extends Config> C loadYaml(File file, Class<C> type) {
-    ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
+    ObjectMapper mapper = new ObjectMapper(new InterpolatingYamlFactory());
     setupObjectMapper(mapper);
     try {
       return mapper.readValue(file, type);
@@ -177,6 +186,56 @@ public class JacksonConfigProvider implements ConfigProvider {
     @SuppressWarnings("unchecked")
     public PrimitiveConfigDeserializer() {
       super(PrimitiveConfig.class, type -> PrimitiveTypes.getPrimitiveType(type).configClass());
+    }
+  }
+
+  private static class InterpolatingYamlFactory extends YAMLFactory {
+    @Override
+    protected YAMLParser _createParser(InputStream in, IOContext ctxt) throws IOException {
+      return new InterpolatingYamlParser(ctxt, _getBufferRecycler(), _parserFeatures, _yamlParserFeatures, _objectCodec, _createReader(in, null, ctxt));
+    }
+  }
+
+  private static class InterpolatingYamlParser extends YAMLParser {
+    private static final String SYS_PATTERN = "\\$\\{sys:([A-Za-z0-9-_.]+)\\}";
+    private static final String ENV_PATTERN = "\\$\\{env:([A-Za-z0-9_]+)\\}";
+
+    InterpolatingYamlParser(IOContext ctxt, BufferRecycler br, int parserFeatures, int formatFeatures, ObjectCodec codec, Reader reader) {
+      super(ctxt, br, parserFeatures, formatFeatures, codec, reader);
+    }
+
+    @Override
+    public String getText() throws IOException {
+      String value = super.getText();
+      return value != null ? interpolateString(value) : null;
+    }
+
+    @Override
+    public String getValueAsString() throws IOException {
+      return getValueAsString(null);
+    }
+
+    @Override
+    public String getValueAsString(String defaultValue) throws IOException {
+      String value = super.getValueAsString(defaultValue);
+      return value != null ? interpolateString(value) : null;
+    }
+
+    private String interpolateString(String value) {
+      value = interpolate(value, SYS_PATTERN, name -> System.getProperty(name, ""));
+      value = interpolate(value, ENV_PATTERN, name -> System.getenv(name));
+      return value;
+    }
+
+    private String interpolate(String value, String pattern, Function<String, String> supplier) {
+      Matcher matcher = Pattern.compile(pattern).matcher(value);
+      while (matcher.find()) {
+        String name = matcher.group(1);
+        String replace = supplier.apply(name);
+        Pattern subPattern = Pattern.compile(Pattern.quote(matcher.group(0)));
+        value = subPattern.matcher(value).replaceAll(replace);
+      }
+      return value;
     }
   }
 }
